@@ -2,7 +2,7 @@
   "name": "speak-with-intention",
   "version": "1.0.0",
   "private": true,
-  "description": "Speak with Intention — 4 haftalık AI destekli İngilizce konuşma rutini (Vercel uyumlu sürüm).",
+  "description": "Speak with Intention \u2014 4 haftal\u0131k AI destekli \u0130ngilizce konu\u015fma rutini (Vercel uyumlu s\u00fcr\u00fcm).",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -79,5 +79,5 @@
     "drizzle-kit": "^0.30.0",
     "typescript": "^5.7.0"
   },
-  "packageManager": "pnpm@9.15.0"
+  "packageManager": "pnpm@9.0.0"
 }
