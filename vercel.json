@@ -1,0 +1,12 @@
+{
+  "buildCommand": "NODE_ENV=production pnpm build",
+  "installCommand": "pnpm install --frozen-lockfile",
+  "functions": {
+    "app/api/trpc/**": {
+      "maxDuration": 60
+    },
+    "app/api/auth/**": {
+      "maxDuration": 30
+    }
+  }
+}

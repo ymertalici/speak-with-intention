@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1786907184770,
+      "tag": "0000_flowery_black_crow",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1786907323003,
+      "tag": "0001_productive_triton",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1786911047707,
+      "tag": "0002_furry_luke_cage",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1786955397377,
+      "tag": "0003_broad_deathbird",
+      "breakpoints": true
+    }
+  ]
+}
