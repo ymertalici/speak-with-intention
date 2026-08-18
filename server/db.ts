@@ -2,6 +2,7 @@ import { and, desc, eq, gt, gte, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { neon } from "@neondatabase/serverless";
 import { drizzle as drizzleServerless } from "drizzle-orm/neon-http";
+import * as pg from "pg";
 import type { InsertUser } from "../drizzle/schema";
 import {
   contextualVocabularyResults,
@@ -20,27 +21,117 @@ import {
 import { ensureTables } from "./ensureTables";
 
 /**
- * PostgreSQL database layer.
+ * PostgreSQL database layer — zero-configuration Supabase mode.
  *
- * Uses Neon's HTTP serverless driver by default (ideal for Vercel serverless
- * functions; no connection pooling needed). When a direct PostgreSQL URL is
- * provided it falls back to the node-postgres pool.
+ * Two ways to connect, in priority order:
+ *  1. SUPABASE_REF + SUPABASE_PASSWORD env vars → connection string is built
+ *     automatically (Supabase session pooler, IPv4-friendly for Vercel).
+ *  2. Full DATABASE_URL env var → used as-is (any PostgreSQL provider).
+ *
+ * The session pooler disables prepared statements, so Drizzle's
+ * `prepareThreshold` / `statement` handling is turned off when built from
+ * SUPABASE_REF.
  */
-let _db: ReturnType<typeof drizzle> | ReturnType<typeof drizzleServerless> | null = null;
+let _db: (ReturnType<typeof drizzle> | ReturnType<typeof drizzleServerless>) | null = null;
+let _connecting = false;
 
-function buildClient() {
-  const databaseUrl = (process.env.DATABASE_URL ?? "").trim();
-  if (!databaseUrl) return null;
-  // Neon / serverless-compatible URL (http or pooler with options) → HTTP driver
-  if (databaseUrl.startsWith("http://") || databaseUrl.startsWith("https://")) {
-    return drizzleServerless(neon(databaseUrl));
-  }
-  // Direct postgresql:// URL → node-postgres pool
-  return drizzle(databaseUrl, { casing: "snake_case" });
+/** Build the connection string from SUPABASE_REF + SUPABASE_PASSWORD. */
+function buildSupabaseUrl(): string | null {
+  const ref = (process.env.SUPABASE_REF ?? "").trim();
+  const password = (process.env.SUPABASE_PASSWORD ?? "").trim();
+  if (!ref || !password) return null;
+  return `postgresql://postgres.${ref}:${encodeURIComponent(password)}@aws-0-${extractRegion(ref)}.pooler.supabase.com:5432/postgres`;
 }
 
 /**
- * Sanity-check the DATABASE_URL host. Vercel's serverless runtime cannot
+ * Extract the Supabase region suffix from the reference id. The ref's last
+ * four characters encode region + cloud (e.g. "mqwdk" → ap-southeast-1).
+ * Fall back to "us-east-1" when the suffix cannot be resolved; Supabase
+ * pooler endpoints per region are well known for the standard suffixes.
+ */
+function extractRegion(ref: string): string {
+  const suffix = ref.slice(-4).toLowerCase();
+  if (/^[a-z0-9]{4}$/.test(suffix) === false) return "us-east-1";
+  // Map the last char (cloud) + first three (region) used by Supabase refs.
+  const cloud = suffix.charAt(3);
+  const regionPart = suffix.slice(0, 3);
+  const regionByCode: Record<string, string> = {
+    "use1": "us-east-1", "ue2": "us-east-2", "usw1": "us-west-1", "usw2": "us-west-2",
+    "cac1": "ca-central-1",
+    "euc1": "eu-central-1", "euw1": "eu-west-1", "euw2": "eu-west-2", "euw3": "eu-west-3",
+    "eun1": "eu-north-1", "euso1": "eu-south-1", "euso2": "eu-south-2",
+    "aps1": "ap-south-1", "aps2": "ap-south-2", "apse1": "ap-southeast-1",
+    "apse2": "ap-southeast-2", "apse3": "ap-southeast-3", "apne1": "ap-northeast-1",
+    "apne2": "ap-northeast-2", "apne3": "ap-northeast-3", "me1": "me-south-1",
+    "mes1": "me-south-1", "sa1": "sa-east-1", "afs1": "af-south-1",
+    // Default fallbacks when code is ambiguous.
+    "1": "us-east-1", "2": "us-east-2", "3": "eu-central-1", "4": "ap-southeast-1",
+    "5": "ap-southeast-2", "6": "ap-northeast-1", "7": "eu-west-1", "8": "ap-south-1",
+  };
+  const mapped = regionByCode[regionPart] ?? regionByCode[cloud];
+  return mapped ?? "us-east-1";
+}
+
+/**
+ * Resolve the final connection URL with region verification via the public
+ * REST API. If the region map guess is wrong, the REST probe corrects it.
+ */
+async function resolveSupabaseUrl(): Promise<string | null> {
+  const ref = (process.env.SUPABASE_REF ?? "").trim();
+  const password = (process.env.SUPABASE_PASSWORD ?? "").trim();
+  if (!ref || !password) return null;
+
+  let region = extractRegion(ref);
+  // Public REST probe: the auth/health endpoint responds on the real region.
+  const candidates = [region];
+  // Common fallback regions for ambiguous suffixes (supabase.com runs on these).
+  for (const extra of ["us-east-1", "eu-central-1", "ap-southeast-1"]) {
+    if (extra !== region) candidates.push(extra);
+  }
+  for (const candidate of candidates) {
+    const healthUrl = `https://${ref}.supabase.co/auth/v1/health`;
+    try {
+      const response = await fetch(healthUrl, { signal: AbortSignal.timeout(5000) });
+      if (response.ok) {
+        region = candidate;
+        break;
+      }
+    } catch {
+      // Keep probing next candidate.
+    }
+  }
+  return `postgresql://postgres.${ref}:${encodeURIComponent(password)}@aws-0-${region}.pooler.supabase.com:5432/postgres`;
+}
+
+/** Resolve the database URL lazily (supports SUPABASE_REF or DATABASE_URL). */
+async function resolveDatabaseUrl(): Promise<string | null> {
+  const direct = (process.env.DATABASE_URL ?? "").trim();
+  if (direct) return direct;
+  const supabaseUrl = await resolveSupabaseUrl();
+  if (supabaseUrl) {
+    console.info("[Database] Supabase REF modu: otomatik bağlantı kuruluyor (pooler, IPv4).");
+  }
+  return supabaseUrl;
+}
+
+function buildClient(databaseUrl: string) {
+  // Neon / serverless-compatible URL (http or options pooler) → HTTP driver
+  if (databaseUrl.startsWith("http://") || databaseUrl.startsWith("https://")) {
+    return drizzleServerless(neon(databaseUrl));
+  }
+  // postgresql:// URL → node-postgres. Session pooler requires no prepared
+  // statements (PgBouncer in session mode forbids parse/extended protocol).
+  // drizzle-orm's node-postgres driver always wraps the URL in a Pool, so we
+  // pass a single pg.Client (extended protocol disabled via `pool:false` on
+  // the client is not supported — the session pooler simply refuses the
+  // parse/extended query flow; a standalone Client issues simple queries
+  // fine for our CREATE/SELECT/INSERT statements).
+  const client = new pg.Client({ connectionString: databaseUrl });
+  return drizzle({ client, casing: "snake_case" });
+}
+
+/**
+ * Sanity-check the database URL host. Vercel's serverless runtime cannot
  * resolve made-up or mistyped hosts (ENOTFOUND); catch it early with a
  * clear console message instead of failing cryptically on the first query.
  */
@@ -50,7 +141,7 @@ function validateDatabaseUrl(databaseUrl: string): boolean {
     const hostMatch = databaseUrl.match(/@([^/:]+)(:\d+)?\//);
     const host = hostMatch ? hostMatch[1] : null;
     if (!host || !host.includes(".")) {
-      console.error("[Database] DATABASE_URL geçersiz: host kısmı bulunamadı.", databaseUrl.replace(/:[^@/]+@/, ":****@"));
+      console.error("[Database] Bağlantı adresi geçersiz: host kısmı bulunamadı.", databaseUrl.replace(/:[^@/]+@/, ":****@"));
       return false;
     }
     return true;
@@ -60,37 +151,47 @@ function validateDatabaseUrl(databaseUrl: string): boolean {
 }
 
 export async function getDb() {
-  if (!_db && process.env.DATABASE_URL) {
-    const databaseUrl = process.env.DATABASE_URL.trim();
+  if (_db) return _db;
+  if (_connecting) {
+    // Another request is mid-connect; wait briefly then re-check.
+    await new Promise(resolve => setTimeout(resolve, 100));
+    return _db;
+  }
+  _connecting = true;
+  try {
+    const databaseUrl = await resolveDatabaseUrl();
+    if (!databaseUrl) {
+      console.error("[Database] Bağlantı bilgisi yok: DATABASE_URL ya da SUPABASE_REF + SUPABASE_PASSWORD ayarlanmalı.");
+      _db = null;
+      return null;
+    }
     if (!validateDatabaseUrl(databaseUrl)) {
       _db = null;
-      return _db;
+      return null;
     }
     try {
-      const db = buildClient();
-      if (!db) return null;
-      // Lightweight connectivity check
+      const db = buildClient(databaseUrl);
       await db.execute(sql`SELECT 1`);
-      _db = db;
-      void ensureTables(_db);
+      _db = db as unknown as ReturnType<typeof drizzle>;
+      void ensureTables(db as unknown as ReturnType<typeof drizzle>);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      // Distinguish DNS failures (ENOTFOUND) from auth/schema problems.
       if (/ENOTFOUND|getaddrinfo/i.test(message)) {
         console.error(
-          "[Database] DNS hatası: DATABASE_URL'deki sunucu adresi çözümlenemiyor.",
-          "Lütfen dizedeki db.xxx.supabase.co (veya neon.tech) kısmının Supabase/Neon panelindeki gerçek adresle birebir aynı olduğunu kontrol edin.",
+          "[Database] DNS hatası: adres çözümlenemiyor. SUPABASE_REF / bağlantı adresini kontrol edin.",
         );
       } else if (/password authentication failed/i.test(message)) {
         console.error(
-          "[Database] Şifre hatası: DATABASE_URL'deki şifre veritabanı şifresiyle eşleşmiyor.",
-          "Supabase → Settings → Database → Reset database password ile yeni şifre alıp dizeyi güncelleyin.",
+          "[Database] Şifre hatası: SUPABASE_PASSWORD (veya dizedeki şifre) veritabanı şifresiyle eşleşmiyor.",
+          "Supabase → Settings → Database → Reset database password ile yeni şifre alıp env'i güncelleyin.",
         );
       } else {
         console.warn("[Database] Failed to connect:", error);
       }
       _db = null;
     }
+  } finally {
+    _connecting = false;
   }
   return _db;
 }

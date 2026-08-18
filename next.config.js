@@ -6,6 +6,8 @@ const nextConfig = {
   typescript: { ignoreBuildErrors: false },
   
   output: "standalone",
+  serverExternalPackages: ["pg"],
+  experimental: { serverMinification: false },
 };
 
 module.exports = nextConfig;

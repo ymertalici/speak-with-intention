@@ -1,4 +1,5 @@
 import type { drizzle } from "drizzle-orm/node-postgres";
+import type { Client, Pool } from "pg";
 
 /**
  * Creates the application tables on first connection (idempotent).
@@ -11,7 +12,7 @@ import type { drizzle } from "drizzle-orm/node-postgres";
  * multi-line CREATE TABLE statements containing CONSTRAINT clauses in the
  * packaged server runtime, so we pass the raw SQL directly.
  */
-export async function ensureTables(db: ReturnType<typeof drizzle>) {
+export async function ensureTables(db: ReturnType<typeof drizzle> & { $client?: Pool | Client }) {
   const statements = [
     `CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
